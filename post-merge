@@ -19,6 +19,8 @@ if (sys.version_info < (3, 5)):
 
 
 API_ENDPOINT = 'https://app.docstring.dev/api/integrations/githook/post-merge'
+if 'DOCSTRING_DEV' in os.environ:
+    API_ENDPOINT = 'http://localhost:4000/api/integrations/githook/post-merge'
 
 
 def get_origin_url(repo: str) -> str:
@@ -141,20 +143,22 @@ if __name__ == "__main__":
         'files': contents,
     }).encode('utf-8')
 
-    if 'DOCSTRING_DEV' in os.environ:
-        API_ENDPOINT = 'http://localhost:4000/api/integrations/githook/post-merge'
-
     req = urllib.request.Request(API_ENDPOINT)
     req.add_header('authorization', f'Bearer {api_key}')
     req.add_header('content-type', 'application/json')
     req.add_header('content-length', str(len(post_data)))
 
     # Timeout so that we don't hold up git operations if hitting the API is slow
-    resp = urllib.request.urlopen(req, post_data, timeout=5)
-    code = resp.getcode()
+    try:
+        resp = urllib.request.urlopen(req, post_data, timeout=5)
+        code = resp.getcode()
 
-    if code != 200:
-        logging.error(f'Error sending code to Docstring: HTTP {code}')
+        if code != 200:
+            logging.error(f'Error sending code to Docstring: HTTP {code}')
+            sys.exit(1)
+
+        print('Successfully sent update to Docstring')
+
+    except urllib.error.HTTPError as e:
+        logging.error(f'Error sending code to Docstring: {e}')
         sys.exit(1)
-
-    print('Successfully sent update to Docstring')
