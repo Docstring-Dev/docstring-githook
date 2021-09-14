@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+from typing import List
+
+# Only stdlib for now so we don't have any packaging
+import argparse
+import configparser
+import json
+import logging
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.request
+
+
+if (sys.version_info < (3, 5)):
+    logging.error(f'Unsupported version of Python')
+    sys.exit(1)
+
+
+API_ENDPOINT = 'https://app.docstring.dev/api/integrations/githook/post-merge'
+
+
+def get_origin_url(repo: str) -> str:
+    origin = subprocess.check_output([
+        'git',
+        '-C', repo,
+        'config',
+        '--get', 'remote.origin.url',
+    ]).decode('utf-8').strip()
+    logging.debug(f'Got origin {origin}')
+    return origin
+
+
+def get_default_branch(repo: str) -> str:
+    branch = subprocess.check_output([
+        'git',
+        '-C', repo,
+        'symbolic-ref', 'refs/remotes/origin/HEAD',
+    ]).decode('utf-8').strip()
+    branch = branch[len('refs/remotes/origin/'):]
+    logging.debug(f'Found default branch {branch}')
+    return branch
+
+
+def get_current_branch(repo: str) -> str:
+    branch = subprocess.check_output([
+        'git',
+        '-C', repo,
+        'rev-parse', '--abbrev-ref', 'HEAD',
+    ]).decode('utf-8').strip()
+    logging.debug(f'Got current branch {branch}')
+    return branch
+
+
+def get_last_commit_id(repo: str) -> str:
+    commit = subprocess.check_output([
+        'git',
+        '-C', repo,
+        'rev-parse', 'HEAD',
+    ]).decode('utf-8').strip()
+    logging.debug(f'Got last commit {commit}')
+    return commit
+
+
+def get_files_in_commit(repo: str, commit: str) -> List[str]:
+    files = subprocess.check_output([
+        'git',
+        '-C', repo,
+        'diff',
+        '--name-only',
+        commit + '~', commit,
+    ]).decode('utf-8').split('\n')[:-1]
+    logging.debug(f'Got files in last commit: {files}')
+    return files
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='docstring.dev Git post-merge Hook')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable debug level logging')
+    args = parser.parse_args()
+
+    log_level = logging.INFO
+    if args.verbose:
+        log_level = logging.DEBUG
+
+    logging.basicConfig(level=log_level)
+
+    config_fn = pathlib.Path.home() / '.docstring/config.ini'
+    config = configparser.ConfigParser()
+
+    if not os.path.exists(config_fn):
+        # pre-populate empty structure so it's obvious where to put the key
+        config['global'] = {'api_key': ''}
+
+        config_fn.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_fn, 'w') as cf:
+            config.write(cf)
+
+        logging.error(f'No configuration found. Please add your api key to ~/.docstring/config.ini')
+        sys.exit(1)
+
+    config.read(config_fn)
+
+    if 'global' not in config or 'api_key' not in config['global']:
+        logging.error(f'api_key missing from configuration')
+        sys.exit(1)
+
+    # strip out leading and trailing quotes since it's a likely mistake
+    api_key = config['global']['api_key'].lstrip("'\"").rstrip("'\"")
+
+    repo = os.getcwd()
+
+    # Post-merge, so the target of the merge will be the current branch
+    target_branch = get_current_branch(repo)
+    default_branch = get_default_branch(repo)
+
+    if target_branch != default_branch:
+        logging.debug(f'Not processing merge to {target_branch} - not targeting the default branch {default_branch}')
+        sys.exit(0)
+
+    commit_id = get_last_commit_id(repo)
+    files = get_files_in_commit(repo, commit_id)
+    contents = []
+
+    for fn in files:
+        with open(os.path.join(repo, fn), 'r') as f:
+            content = f.read()
+
+        if '@docstring' in contents:
+            contents.append({
+                "filename": pathlib.Path(fn).name,
+                "path": str(pathlib.Path(fn).parent),
+                "content": content,
+            })
+
+    post_data = json.dumps({
+        'repo': pathlib.Path(repo).name,
+        'branch': target_branch,
+        'commit': commit_id,
+        'files': contents,
+    }).encode('utf-8')
+
+    if 'DOCSTRING_DEV' in os.environ:
+        API_ENDPOINT = 'http://localhost:4000/api/integrations/githook/post-merge'
+
+    req = urllib.request.Request(API_ENDPOINT)
+    req.add_header('authorization', f'Bearer {api_key}')
+    req.add_header('content-type', 'application/json')
+    req.add_header('content-length', str(len(post_data)))
+
+    # Timeout so that we don't hold up git operations if hitting the API is slow
+    resp = urllib.request.urlopen(req, post_data, timeout=5)
+    code = resp.getcode()
+
+    if code != 200:
+        logging.error(f'Error sending code to Docstring: HTTP {code}')
+        sys.exit(1)
+
+    print('Successfully sent update to Docstring')
